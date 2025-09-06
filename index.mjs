@@ -14,6 +14,7 @@ dotenv.config();
 
 const N8N_INCOMING_URL = process.env.N8N_INCOMING_URL || "";
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || "";
+const SEND_TOKEN = process.env.SEND_TOKEN || ""; // auth utk /send-private & /send-group
 const logger = pino({ level: "info" });
 const PORT = process.env.PORT || 3000;
 
@@ -75,6 +76,44 @@ function scheduleReconnect(fn, ms = 1500) {
     reconnectTimer = null;
     fn();
   }, ms);
+}
+
+// ===== Helper: group & mention =====
+function isGroupJid(jid) {
+  return typeof jid === "string" && jid.endsWith("@g.us");
+}
+
+function getMentionedJids(msg) {
+  const ci =
+    msg?.message?.extendedTextMessage?.contextInfo ||
+    msg?.message?.imageMessage?.contextInfo ||
+    msg?.message?.videoMessage?.contextInfo ||
+    msg?.message?.documentMessage?.contextInfo ||
+    msg?.message?.stickerMessage?.contextInfo ||
+    {};
+  const mentions = ci?.mentionedJid || [];
+  return Array.isArray(mentions) ? mentions.map((j) => j.toLowerCase()) : [];
+}
+
+function isMentioningMe(msg, myJid) {
+  if (!myJid) return false;
+  return getMentionedJids(msg).includes(String(myJid).toLowerCase());
+}
+
+// ===== Helper: normalisasi tujuan kirim =====
+function normalizePrivateToJid(input) {
+  let s = String(input || "").trim();
+  if (!s) return null;
+  if (s.endsWith("@s.whatsapp.net")) return s;
+
+  s = s.replace(/[^\d]/g, "");
+  if (s.startsWith("0")) s = "62" + s.slice(1);
+  if (!/^62\d{6,15}$/.test(s)) return null;
+  return `${s}@s.whatsapp.net`;
+}
+
+function isGroupJidStrict(jid) {
+  return typeof jid === "string" && /@g\.us$/.test(jid);
 }
 
 async function startWA() {
@@ -187,6 +226,14 @@ async function startWA() {
 
     if (!text) return;
 
+    // ===== DI GRUP: harus mention bot =====
+    if (isGroupJid(from)) {
+      const myJid = sock?.user?.id;
+      if (!isMentioningMe(msg, myJid)) {
+        return; // diam kalau tidak di-mention
+      }
+    }
+
     try {
       // COMMAND ROUTER
       if (lower === "ping") {
@@ -205,9 +252,7 @@ async function startWA() {
             "- `balas <teks>` → bot membalas teks",
             "- `foto <url>` → kirim gambar dari URL",
             "",
-            "Contoh:",
-            "`balas Halo juga!`",
-            "`foto https://picsum.photos/600`",
+            "Catatan: di *grup*, bot hanya merespons jika *di-mention*.",
           ].join("\n")
         );
       }
@@ -223,7 +268,12 @@ async function startWA() {
 
       if (lower === "waktu") {
         const now = new Date();
-        return await sendText(from, `⏰ ${now.toLocaleString()}`);
+        return await sendText(
+          from,
+          `⏰ ${now.toLocaleString("id-ID", {
+            timeZone: "Asia/Jakarta",
+          })} (WIB)`
+        );
       }
 
       if (lower === "id") {
@@ -323,7 +373,7 @@ app.get("/qr", async (_, res) => {
   }
 });
 
-// kirim teks: GET /sendText?to=62812xxxx&text=Halo
+// kirim teks: GET /sendText?to=62812xxxx&text=Halo (private only via query)
 app.get("/sendText", async (req, res) => {
   try {
     let to = (req.query.to || "").trim();
@@ -346,6 +396,74 @@ app.get("/sendText", async (req, res) => {
     res
       .status(500)
       .json({ ok: false, error: String(e?.message || e), ready: isReady });
+  }
+});
+
+// POST /send-private  body: { to: "62812xxxx" | "62812xxxx@s.whatsapp.net", text: "..." }
+app.post("/send-private", async (req, res) => {
+  try {
+    const auth = req.headers["authorization"] || "";
+    if (SEND_TOKEN && auth !== `Bearer ${SEND_TOKEN}`) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const { to, text } = req.body || {};
+    if (!to || !text) {
+      return res.status(400).json({ ok: false, error: "to & text required" });
+    }
+
+    const jid = normalizePrivateToJid(to);
+    if (!jid) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Format nomor tidak valid. Contoh: 62812xxxx atau 62812xxxx@s.whatsapp.net",
+      });
+    }
+
+    await sendSafe(jid, { text });
+    res.json({ ok: true, jid });
+  } catch (e) {
+    logger.error({ e }, "/send-private failed");
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// POST /send-group  body: { gid: "1203630xxxx@g.us", text: "...", mentions?: ["62...@s.whatsapp.net", ...] }
+app.post("/send-group", async (req, res) => {
+  try {
+    const auth = req.headers["authorization"] || "";
+    if (SEND_TOKEN && auth !== `Bearer ${SEND_TOKEN}`) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const { gid, text, mentions } = req.body || {};
+    if (!gid || !text) {
+      return res.status(400).json({ ok: false, error: "gid & text required" });
+    }
+    if (!isGroupJidStrict(gid)) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error: "gid harus JID group (akhiri dengan @g.us)",
+        });
+    }
+
+    const payload = { text };
+    if (Array.isArray(mentions) && mentions.length) {
+      payload.mentions = mentions;
+    }
+
+    await sendSafe(gid, payload);
+    res.json({
+      ok: true,
+      gid,
+      mentioned: Array.isArray(mentions) ? mentions.length : 0,
+    });
+  } catch (e) {
+    logger.error({ e }, "/send-group failed");
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
