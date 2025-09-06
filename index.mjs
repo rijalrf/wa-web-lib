@@ -151,9 +151,9 @@ function getServerIp() {
 
 async function announceUp() {
   const msg =
-    `✅ *Server up and running*\n` +
+    `✅ *Server Up and Running*\n` +
     `Server : ${SERVER_NAME}\n` +
-    `IP     : ${getServerIp()}\n` +
+    // `IP     : ${getServerIp()}\n` +
     `Waktu  : ${nowWIB()} (WIB)\n` +
     `Status : connected ✅`;
 
@@ -515,12 +515,10 @@ app.post("/send-group", async (req, res) => {
       return res.status(400).json({ ok: false, error: "gid & text required" });
     }
     if (!isGroupJidStrict(gid)) {
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          error: "gid harus JID group (akhiri dengan @g.us)",
-        });
+      return res.status(400).json({
+        ok: false,
+        error: "gid harus JID group (akhiri dengan @g.us)",
+      });
     }
     const payload = { text };
     if (Array.isArray(mentions) && mentions.length) {
