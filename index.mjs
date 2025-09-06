@@ -6,6 +6,7 @@ import makeWASocket, {
   DisconnectReason,
 } from "@whiskeysockets/baileys";
 import qrcode from "qrcode-terminal";
+import QR from "qrcode"; // <-- untuk render QR ke SVG di /qr
 
 dotenv.config();
 
@@ -15,6 +16,7 @@ const SESSION_DIR = process.env.SESSION_DIR || "./auth";
 
 let sock;
 let isReady = false; // koneksi WA OPEN?
+let lastQR = ""; // simpan QR terakhir untuk /qr
 
 // ===== Helper: ekstrak teks dari berbagai tipe pesan =====
 function extractText(msg) {
@@ -45,7 +47,6 @@ function extractText(msg) {
   if (typeof t2 === "string") return t2;
 
   try {
-    // kalau paramsJson berisi JSON, coba ambil 'id'/'text'
     if (t2) {
       const parsed = JSON.parse(t2);
       return (
@@ -75,6 +76,7 @@ async function startWA() {
     const { connection, lastDisconnect, qr } = u;
 
     if (qr) {
+      lastQR = qr; // simpan untuk endpoint /qr
       console.clear();
       console.log("Scan QR ini di WhatsApp > Perangkat Tertaut:");
       qrcode.generate(qr, { small: false }); // besar biar mudah discan
@@ -82,6 +84,7 @@ async function startWA() {
 
     if (connection === "open") {
       isReady = true;
+      lastQR = ""; // QR tak diperlukan lagi
       logger.info("WA connected ✅");
     } else if (connection === "close") {
       isReady = false;
@@ -140,7 +143,7 @@ async function startWA() {
           from,
           `👋 Hai *${
             pushName || "teman"
-          }*!\nBot ini jalan lokal (Baileys/WA Web).\nKetik *menu* untuk lihat perintah.`
+          }*!\nBot ini jalan (Baileys/WA Web).\nKetik *menu* untuk lihat perintah.`
         );
       }
 
@@ -234,6 +237,18 @@ app.use(express.json());
 
 app.get("/health", (_, res) => res.json({ ok: true, ready: isReady }));
 
+// tampilkan QR di browser (SVG)
+app.get("/qr", async (_, res) => {
+  try {
+    if (!lastQR) return res.status(404).send("QR belum tersedia");
+    const svg = await QR.toString(lastQR, { type: "svg", margin: 2 });
+    res.setHeader("Content-Type", "image/svg+xml");
+    res.send(svg);
+  } catch (e) {
+    res.status(500).send("Gagal merender QR");
+  }
+});
+
 // kirim teks: GET /sendText?to=62812xxxx&text=Halo
 app.get("/sendText", async (req, res) => {
   try {
@@ -260,7 +275,8 @@ app.get("/sendText", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
+  // <-- bind ke semua interface (penting di CapRover)
   console.log("REST listening on :" + PORT);
   startWA();
 });
