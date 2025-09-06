@@ -326,8 +326,8 @@ async function startWA() {
       }
 
       // DEFAULT: echo
-      await delayHuman();
-      await sendText(from, `Echo: ${text}`);
+      // await delayHuman();
+      // await sendText(from, `Echo: ${text}`);
     } catch (err) {
       logger.error({ err }, "Gagal memproses pesan masuk");
     }
