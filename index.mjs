@@ -10,6 +10,8 @@ import QR from "qrcode"; // <-- untuk render QR ke SVG di /qr
 
 dotenv.config();
 
+const N8N_INCOMING_URL = process.env.N8N_INCOMING_URL || "";
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || "";
 const logger = pino({ level: "info" });
 const PORT = process.env.PORT || 3000;
 const SESSION_DIR = process.env.SESSION_DIR || "./auth";
@@ -110,6 +112,29 @@ async function startWA() {
 
     // log ringan agar kelihatan apa yang diterima
     logger.info({ from, pushName, text }, "Incoming message");
+
+    // --- Forward ke n8n (fire-and-forget) ---
+    if (N8N_INCOMING_URL && text) {
+      try {
+        await fetch(N8N_INCOMING_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Webhook-Token": WEBHOOK_TOKEN,
+          },
+          body: JSON.stringify({
+            from, // ex: 62812xxxx@s.whatsapp.net
+            text, // isi pesan
+            pushName, // nama tampilan
+            messageId: msg.key.id,
+            timestamp: (msg.messageTimestamp || 0) * 1000,
+            isGroup: from.endsWith("@g.us"),
+          }),
+        });
+      } catch (err) {
+        logger.warn({ err }, "Gagal POST ke n8n");
+      }
+    }
 
     if (!text) return;
 
