@@ -4,17 +4,19 @@ import dotenv from "dotenv";
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
+  jidNormalizedUser, // ⬅️ penting buat normalisasi JID
 } from "@whiskeysockets/baileys";
 import qrcode from "qrcode-terminal";
 import QR from "qrcode"; // render QR ke SVG/PNG di /qr
 import fs from "fs/promises";
-import path from "path";
 
 dotenv.config();
 
 const N8N_INCOMING_URL = process.env.N8N_INCOMING_URL || "";
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || "";
 const SEND_TOKEN = process.env.SEND_TOKEN || ""; // auth utk /send-private & /send-group
+const FALLBACK_TEXT_MENTION =
+  (process.env.FALLBACK_TEXT_MENTION ?? "true").toLowerCase() !== "false";
 const logger = pino({ level: "info" });
 const PORT = process.env.PORT || 3000;
 
@@ -25,7 +27,7 @@ let sock;
 let isReady = false; // koneksi WA OPEN?
 let lastQR = ""; // simpan QR terakhir untuk /qr
 let starting = false; // guard: cegah double start
-let reconnectTimer = null; // simpan timer backoff
+let reconnectTimer = null;
 
 // ===== Helper: ekstrak teks dari berbagai tipe pesan =====
 function extractText(msg) {
@@ -40,7 +42,6 @@ function extractText(msg) {
     m1.extendedTextMessage?.text ||
     m1.imageMessage?.caption ||
     m1.videoMessage?.caption;
-
   if (t1) return t1;
 
   const t2 =
@@ -92,24 +93,27 @@ function getMentionedJids(msg) {
     msg?.message?.stickerMessage?.contextInfo ||
     {};
   const mentions = ci?.mentionedJid || [];
-  return Array.isArray(mentions) ? mentions.map((j) => j.toLowerCase()) : [];
+  return Array.isArray(mentions)
+    ? mentions.map((j) => jidNormalizedUser(String(j || "")))
+    : [];
 }
 
 function isMentioningMe(msg, myJid) {
   if (!myJid) return false;
-  return getMentionedJids(msg).includes(String(myJid).toLowerCase());
+  const me = jidNormalizedUser(String(myJid));
+  return getMentionedJids(msg).includes(me);
 }
 
 // ===== Helper: normalisasi tujuan kirim =====
 function normalizePrivateToJid(input) {
   let s = String(input || "").trim();
   if (!s) return null;
-  if (s.endsWith("@s.whatsapp.net")) return s;
+  if (s.endsWith("@s.whatsapp.net")) return jidNormalizedUser(s);
 
   s = s.replace(/[^\d]/g, "");
   if (s.startsWith("0")) s = "62" + s.slice(1);
   if (!/^62\d{6,15}$/.test(s)) return null;
-  return `${s}@s.whatsapp.net`;
+  return jidNormalizedUser(`${s}@s.whatsapp.net`);
 }
 
 function isGroupJidStrict(jid) {
@@ -156,7 +160,6 @@ async function startWA() {
       isReady = false;
       starting = false;
 
-      // Ambil kode/penyebab close
       const code =
         lastDisconnect?.error?.output?.statusCode ??
         lastDisconnect?.error?.status ??
@@ -174,7 +177,6 @@ async function startWA() {
           .includes("logged out");
 
       if (loggedOut) {
-        // Hapus sesi lalu mulai ulang → akan muncul QR baru
         logger.warn("Detected LOGGED OUT — resetting session dir…");
         try {
           await fs.rm(SESSION_DIR, { recursive: true, force: true });
@@ -184,7 +186,6 @@ async function startWA() {
         }
       }
 
-      // backoff singkat sebelum reconnect
       scheduleReconnect(() => startWA(), 1500);
     }
   });
@@ -198,6 +199,9 @@ async function startWA() {
     const pushName = msg.pushName || "";
     const text = (extractText(msg) || "").trim();
     const lower = text.toLowerCase();
+
+    // Debug optional:
+    // logger.info({ rawFrom: from, userId: sock?.user?.id, mentions: getMentionedJids(msg) }, "DBG group mention");
 
     logger.info({ from, pushName, text }, "Incoming message");
 
@@ -229,8 +233,21 @@ async function startWA() {
     // ===== DI GRUP: harus mention bot =====
     if (isGroupJid(from)) {
       const myJid = sock?.user?.id;
-      if (!isMentioningMe(msg, myJid)) {
-        return; // diam kalau tidak di-mention
+      const iAmMentioned = isMentioningMe(msg, myJid);
+
+      // Fallback: kalau user gak klik mention, izinkan kalau teks mengandung sebagian nomor bot / kata "bot"
+      let fallbackMention = false;
+      if (FALLBACK_TEXT_MENTION && !iAmMentioned && text) {
+        const bare = jidNormalizedUser(String(myJid || "")); // 62812...@s.whatsapp.net
+        const myMsisdn = bare.split("@")[0]; // 62812...
+        const last7 = myMsisdn.slice(-7);
+        const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        fallbackMention =
+          new RegExp(esc(last7)).test(text) || /\b(bot|wa-?bot)\b/i.test(text);
+      }
+
+      if (!iAmMentioned && !fallbackMention) {
+        return; // diam kalau tidak di-mention beneran & fallback tidak terpenuhi
       }
     }
 
@@ -442,17 +459,15 @@ app.post("/send-group", async (req, res) => {
       return res.status(400).json({ ok: false, error: "gid & text required" });
     }
     if (!isGroupJidStrict(gid)) {
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          error: "gid harus JID group (akhiri dengan @g.us)",
-        });
+      return res.status(400).json({
+        ok: false,
+        error: "gid harus JID group (akhiri dengan @g.us)",
+      });
     }
 
     const payload = { text };
     if (Array.isArray(mentions) && mentions.length) {
-      payload.mentions = mentions;
+      payload.mentions = mentions.map((m) => jidNormalizedUser(String(m)));
     }
 
     await sendSafe(gid, payload);
