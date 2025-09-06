@@ -4,11 +4,12 @@ import dotenv from "dotenv";
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
-  jidNormalizedUser, // ⬅️ penting buat normalisasi JID
+  jidNormalizedUser,
 } from "@whiskeysockets/baileys";
 import qrcode from "qrcode-terminal";
-import QR from "qrcode"; // render QR ke SVG/PNG di /qr
+import QR from "qrcode";
 import fs from "fs/promises";
+import os from "os";
 
 dotenv.config();
 
@@ -17,19 +18,28 @@ const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || "";
 const SEND_TOKEN = process.env.SEND_TOKEN || ""; // auth utk /send-private & /send-group
 const FALLBACK_TEXT_MENTION =
   (process.env.FALLBACK_TEXT_MENTION ?? "true").toLowerCase() !== "false";
-const logger = pino({ level: "info" });
 const PORT = process.env.PORT || 3000;
+const logger = pino({ level: "info" });
 
 // PENTING: path ini harus DIPERSIST di CapRover (mount volume)
 const SESSION_DIR = process.env.SESSION_DIR || "/usr/src/app/auth";
 
-let sock;
-let isReady = false; // koneksi WA OPEN?
-let lastQR = ""; // simpan QR terakhir untuk /qr
-let starting = false; // guard: cegah double start
-let reconnectTimer = null;
+// Notifikasi UP targets
+const UP_PRIVATE = process.env.UP_PRIVATE || ""; // 62...@s.whatsapp.net
+const UP_GROUP = process.env.UP_GROUP || ""; // 120...@g.us
+const SERVER_NAME =
+  process.env.SERVER_NAME || process.env.APP_NAME || os.hostname();
+const SERVER_IP_ENV = process.env.SERVER_IP || "";
 
-// ===== Helper: ekstrak teks dari berbagai tipe pesan =====
+// state
+let sock;
+let isReady = false;
+let lastQR = "";
+let starting = false;
+let reconnectTimer = null;
+let announcedBoot = false;
+
+// ===== Helpers =====
 function extractText(msg) {
   const m = msg?.message;
   if (!m) return "";
@@ -79,7 +89,6 @@ function scheduleReconnect(fn, ms = 1500) {
   }, ms);
 }
 
-// ===== Helper: group & mention =====
 function isGroupJid(jid) {
   return typeof jid === "string" && jid.endsWith("@g.us");
 }
@@ -104,7 +113,6 @@ function isMentioningMe(msg, myJid) {
   return getMentionedJids(msg).includes(me);
 }
 
-// ===== Helper: normalisasi tujuan kirim =====
 function normalizePrivateToJid(input) {
   let s = String(input || "").trim();
   if (!s) return null;
@@ -120,6 +128,75 @@ function isGroupJidStrict(jid) {
   return typeof jid === "string" && /@g\.us$/.test(jid);
 }
 
+function nowWIB() {
+  return new Intl.DateTimeFormat("id-ID", {
+    timeZone: "Asia/Jakarta",
+    dateStyle: "medium",
+    timeStyle: "medium",
+  }).format(new Date());
+}
+
+function getServerIp() {
+  if (SERVER_IP_ENV) return SERVER_IP_ENV;
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const ni of nets[name] || []) {
+      if (ni.family === "IPv4" && !ni.internal) {
+        return ni.address; // catatan: ini IP container/host lokal; pakai SERVER_IP env untuk public IP
+      }
+    }
+  }
+  return "unknown";
+}
+
+async function announceUp() {
+  const msg =
+    `✅ *Server up and running*\n` +
+    `Server : ${SERVER_NAME}\n` +
+    `IP     : ${getServerIp()}\n` +
+    `Waktu  : ${nowWIB()} (WIB)\n` +
+    `Status : connected ✅`;
+
+  const targets = [UP_PRIVATE, UP_GROUP].filter(Boolean);
+  for (const jid of targets) {
+    try {
+      await sendSafe(jid, { text: msg });
+    } catch (e) {
+      logger.warn({ jid, e }, "announceUp failed");
+    }
+  }
+}
+
+// reset helpers (anti-EBUSY)
+async function closeSocketGracefully() {
+  try {
+    await sock?.logout?.().catch(() => {});
+  } catch {}
+  try {
+    await sock?.ws?.close?.();
+  } catch {}
+  try {
+    sock = null;
+  } catch {}
+}
+
+async function forceRemoveDir(dir, attempts = 5) {
+  const bak = `${dir}.bak-${Date.now()}`;
+  try {
+    await fs.rename(dir, bak).catch(() => {});
+  } catch {}
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await fs.rm(bak, { recursive: true, force: true });
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 300 + i * 200));
+    }
+  }
+  await fs.rm(dir, { recursive: true, force: true });
+}
+
+// ===== WhatsApp socket =====
 async function startWA() {
   if (starting) return;
   starting = true;
@@ -129,7 +206,7 @@ async function startWA() {
 
   sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false, // kita handle sendiri
+    printQRInTerminal: false,
     browser: ["Windows", "Chrome", "120.0.0"],
     markOnlineOnConnect: false,
     syncFullHistory: false,
@@ -154,6 +231,11 @@ async function startWA() {
       lastQR = "";
       starting = false;
       logger.info("WA connected ✅");
+
+      if (!announcedBoot) {
+        announcedBoot = true;
+        announceUp().catch((e) => logger.warn({ e }, "announceUp error"));
+      }
     }
 
     if (connection === "close") {
@@ -190,7 +272,7 @@ async function startWA() {
     }
   });
 
-  // ==== AUTO-REPLY LOKAL (satu handler saja) ====
+  // ==== message handler ====
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages?.[0];
     if (!msg || msg.key.fromMe) return;
@@ -200,12 +282,9 @@ async function startWA() {
     const text = (extractText(msg) || "").trim();
     const lower = text.toLowerCase();
 
-    // Debug optional:
-    // logger.info({ rawFrom: from, userId: sock?.user?.id, mentions: getMentionedJids(msg) }, "DBG group mention");
-
     logger.info({ from, pushName, text }, "Incoming message");
 
-    // --- Forward ke n8n (fire-and-forget) ---
+    // forward ke n8n
     if (N8N_INCOMING_URL && text) {
       try {
         await fetch(N8N_INCOMING_URL, {
@@ -230,32 +309,26 @@ async function startWA() {
 
     if (!text) return;
 
-    // ===== DI GRUP: harus mention bot =====
+    // di grup: wajib mention
     if (isGroupJid(from)) {
       const myJid = sock?.user?.id;
       const iAmMentioned = isMentioningMe(msg, myJid);
 
-      // Fallback: kalau user gak klik mention, izinkan kalau teks mengandung sebagian nomor bot / kata "bot"
       let fallbackMention = false;
       if (FALLBACK_TEXT_MENTION && !iAmMentioned && text) {
-        const bare = jidNormalizedUser(String(myJid || "")); // 62812...@s.whatsapp.net
-        const myMsisdn = bare.split("@")[0]; // 62812...
+        const bare = jidNormalizedUser(String(myJid || "")); // 628xx...@s.whatsapp.net
+        const myMsisdn = bare.split("@")[0];
         const last7 = myMsisdn.slice(-7);
         const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         fallbackMention =
           new RegExp(esc(last7)).test(text) || /\b(bot|wa-?bot)\b/i.test(text);
       }
 
-      if (!iAmMentioned && !fallbackMention) {
-        return; // diam kalau tidak di-mention beneran & fallback tidak terpenuhi
-      }
+      if (!iAmMentioned && !fallbackMention) return;
     }
 
     try {
-      // COMMAND ROUTER
-      if (lower === "ping") {
-        return await sendText(from, "pong ✅");
-      }
+      if (lower === "ping") return await sendText(from, "pong ✅");
 
       if (lower === "menu" || lower === "!help" || lower === "help") {
         return await sendText(
@@ -284,13 +357,7 @@ async function startWA() {
       }
 
       if (lower === "waktu") {
-        const now = new Date();
-        return await sendText(
-          from,
-          `⏰ ${now.toLocaleString("id-ID", {
-            timeZone: "Asia/Jakarta",
-          })} (WIB)`
-        );
+        return await sendText(from, `⏰ ${nowWIB()} (WIB)`);
       }
 
       if (lower === "id") {
@@ -325,27 +392,23 @@ async function startWA() {
         });
       }
 
-      // DEFAULT: echo
-      // await delayHuman();
-      // await sendText(from, `Echo: ${text}`);
+      // default: diam (echo dimatikan)
+      return;
     } catch (err) {
       logger.error({ err }, "Gagal memproses pesan masuk");
     }
   });
 }
 
-// helper kirim teks dengan jeda “manusia”
+// send helpers
 async function sendText(jid, text) {
   await delayHuman();
   return sock.sendMessage(jid, { text });
 }
-
 function delayHuman(min = 300, max = 1200) {
   const ms = Math.floor(Math.random() * (max - min + 1)) + min;
   return new Promise((r) => setTimeout(r, ms));
 }
-
-// Tunggu sampai ready (max 15 detik)
 async function waitForReady(timeoutMs = 15000) {
   const start = Date.now();
   while (!isReady && Date.now() - start < timeoutMs) {
@@ -353,8 +416,6 @@ async function waitForReady(timeoutMs = 15000) {
   }
   if (!isReady) throw new Error("not-ready-timeout");
 }
-
-// Kirim aman + 1x retry jika koneksi tertutup
 async function sendSafe(jid, content) {
   try {
     await waitForReady(15000);
@@ -376,7 +437,6 @@ app.use(express.json());
 
 app.get("/health", (_, res) => res.json({ ok: true, ready: isReady }));
 
-// tampilkan QR di browser (SVG)
 app.get("/qr", async (_, res) => {
   try {
     if (isReady) return res.status(200).send("Sudah tersambung. Tidak ada QR.");
@@ -423,12 +483,10 @@ app.post("/send-private", async (req, res) => {
     if (SEND_TOKEN && auth !== `Bearer ${SEND_TOKEN}`) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
-
     const { to, text } = req.body || {};
     if (!to || !text) {
       return res.status(400).json({ ok: false, error: "to & text required" });
     }
-
     const jid = normalizePrivateToJid(to);
     if (!jid) {
       return res.status(400).json({
@@ -437,7 +495,6 @@ app.post("/send-private", async (req, res) => {
           "Format nomor tidak valid. Contoh: 62812xxxx atau 62812xxxx@s.whatsapp.net",
       });
     }
-
     await sendSafe(jid, { text });
     res.json({ ok: true, jid });
   } catch (e) {
@@ -453,23 +510,22 @@ app.post("/send-group", async (req, res) => {
     if (SEND_TOKEN && auth !== `Bearer ${SEND_TOKEN}`) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
-
     const { gid, text, mentions } = req.body || {};
     if (!gid || !text) {
       return res.status(400).json({ ok: false, error: "gid & text required" });
     }
     if (!isGroupJidStrict(gid)) {
-      return res.status(400).json({
-        ok: false,
-        error: "gid harus JID group (akhiri dengan @g.us)",
-      });
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error: "gid harus JID group (akhiri dengan @g.us)",
+        });
     }
-
     const payload = { text };
     if (Array.isArray(mentions) && mentions.length) {
       payload.mentions = mentions.map((m) => jidNormalizedUser(String(m)));
     }
-
     await sendSafe(gid, payload);
     res.json({
       ok: true,
@@ -482,15 +538,31 @@ app.post("/send-group", async (req, res) => {
   }
 });
 
-// reset sesi manual (opsional)
+// logout (putus tanpa hapus sesi)
+app.post("/logout", async (_, res) => {
+  try {
+    await closeSocketGracefully();
+    lastQR = "";
+    isReady = false;
+    starting = false;
+    scheduleReconnect(() => startWA(), 300);
+    res.json({ ok: true, message: "Logged out. Open /qr to scan new code." });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// reset sesi (aman anti-EBUSY)
 app.post("/reset-session", async (_, res) => {
   try {
-    await fs.rm(SESSION_DIR, { recursive: true, force: true });
+    await closeSocketGracefully();
+    await forceRemoveDir(SESSION_DIR);
     await fs.mkdir(SESSION_DIR, { recursive: true });
     lastQR = "";
     isReady = false;
     starting = false;
-    scheduleReconnect(() => startWA(), 300); // trigger start ulang cepat
+    announcedBoot = false;
+    scheduleReconnect(() => startWA(), 300);
     res.json({ ok: true, message: "Session cleared. Reload /qr to scan." });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
@@ -502,7 +574,6 @@ app.listen(PORT, "0.0.0.0", () => {
   startWA().catch((e) => logger.error(e));
 });
 
-// Graceful shutdown
 for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, async () => {
     try {
