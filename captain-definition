@@ -1,4 +1,10 @@
 {
   "schemaVersion": 2,
-  "dockerfilePath": "./Dockerfile"
+  "dockerfilePath": "./Dockerfile",
+  "volumes": [
+    {
+      "containerPath": "/app/auth",
+      "volumeName": "wa-bot-auth"
+    }
+  ]
 }
