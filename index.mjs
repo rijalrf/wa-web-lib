@@ -6,7 +6,9 @@ import makeWASocket, {
   DisconnectReason,
 } from "@whiskeysockets/baileys";
 import qrcode from "qrcode-terminal";
-import QR from "qrcode"; // <-- untuk render QR ke SVG di /qr
+import QR from "qrcode"; // render QR ke SVG/PNG di /qr
+import fs from "fs/promises";
+import path from "path";
 
 dotenv.config();
 
@@ -14,22 +16,24 @@ const N8N_INCOMING_URL = process.env.N8N_INCOMING_URL || "";
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || "";
 const logger = pino({ level: "info" });
 const PORT = process.env.PORT || 3000;
-const SESSION_DIR = process.env.SESSION_DIR || "./auth";
+
+// PENTING: path ini harus DIPERSIST di CapRover (mount volume)
+const SESSION_DIR = process.env.SESSION_DIR || "/usr/src/app/auth";
 
 let sock;
 let isReady = false; // koneksi WA OPEN?
 let lastQR = ""; // simpan QR terakhir untuk /qr
+let starting = false; // guard: cegah double start
+let reconnectTimer = null; // simpan timer backoff
 
 // ===== Helper: ekstrak teks dari berbagai tipe pesan =====
 function extractText(msg) {
   const m = msg?.message;
   if (!m) return "";
 
-  // unwrap common wrappers
   const unwrap = (x) => x?.message || x;
   const m1 = unwrap(m.ephemeralMessage) || unwrap(m.viewOnceMessageV2) || m;
 
-  // text/plain
   const t1 =
     m1.conversation ||
     m1.extendedTextMessage?.text ||
@@ -38,13 +42,12 @@ function extractText(msg) {
 
   if (t1) return t1;
 
-  // tombol & interaktif
   const t2 =
     m1.buttonsResponseMessage?.selectedDisplayText ||
     m1.templateButtonReplyMessage?.selectedDisplayText ||
     m1.listResponseMessage?.singleSelectReply?.selectedRowId ||
     m1.interactiveResponseMessage?.body?.text ||
-    m1.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson; // kadang JSON
+    m1.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
 
   if (typeof t2 === "string") return t2;
 
@@ -60,57 +63,103 @@ function extractText(msg) {
   return "";
 }
 
+async function ensureSessionDir() {
+  try {
+    await fs.mkdir(SESSION_DIR, { recursive: true });
+  } catch {}
+}
+
+function scheduleReconnect(fn, ms = 1500) {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    fn();
+  }, ms);
+}
+
 async function startWA() {
+  if (starting) return;
+  starting = true;
+  await ensureSessionDir();
+
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
   sock = makeWASocket({
     auth: state,
+    printQRInTerminal: false, // kita handle sendiri
     browser: ["Windows", "Chrome", "120.0.0"],
     markOnlineOnConnect: false,
     syncFullHistory: false,
+    logger,
   });
 
-  // simpan kredensial saat berubah
   sock.ev.on("creds.update", saveCreds);
 
-  // QR & status koneksi
-  sock.ev.on("connection.update", (u) => {
+  sock.ev.on("connection.update", async (u) => {
     const { connection, lastDisconnect, qr } = u;
 
     if (qr) {
-      lastQR = qr; // simpan untuk endpoint /qr
+      lastQR = qr;
       console.clear();
-      console.log("Scan QR ini di WhatsApp > Perangkat Tertaut:");
-      qrcode.generate(qr, { small: false }); // besar biar mudah discan
+      console.log("Scan QR di WhatsApp > Perangkat Tertaut:");
+      qrcode.generate(qr, { small: false });
+      logger.info("QR updated — buka /qr untuk scan.");
     }
 
     if (connection === "open") {
       isReady = true;
-      lastQR = ""; // QR tak diperlukan lagi
+      lastQR = "";
+      starting = false;
       logger.info("WA connected ✅");
-    } else if (connection === "close") {
+    }
+
+    if (connection === "close") {
       isReady = false;
-      const code = lastDisconnect?.error?.output?.statusCode;
-      logger.warn({ code }, "WA closed. Reconnecting if possible…");
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      if (shouldReconnect) startWA();
-      else logger.error("Logged out. Hapus folder auth & scan ulang.");
-    } else if (connection) {
-      logger.info({ connection }, "WA connection state…");
+      starting = false;
+
+      // Ambil kode/penyebab close
+      const code =
+        lastDisconnect?.error?.output?.statusCode ??
+        lastDisconnect?.error?.status ??
+        lastDisconnect?.error?.code;
+
+      const reason = lastDisconnect?.error?.reason || lastDisconnect?.error;
+      logger.warn({ code, reason }, "Connection closed");
+
+      const loggedOut =
+        code === DisconnectReason.loggedOut ||
+        lastDisconnect?.error?.output?.statusCode ===
+          DisconnectReason.loggedOut ||
+        String(reason || "")
+          .toLowerCase()
+          .includes("logged out");
+
+      if (loggedOut) {
+        // Hapus sesi lalu mulai ulang → akan muncul QR baru
+        logger.warn("Detected LOGGED OUT — resetting session dir…");
+        try {
+          await fs.rm(SESSION_DIR, { recursive: true, force: true });
+          await fs.mkdir(SESSION_DIR, { recursive: true });
+        } catch (e) {
+          logger.error(e, "Failed to reset session dir");
+        }
+      }
+
+      // backoff singkat sebelum reconnect
+      scheduleReconnect(() => startWA(), 1500);
     }
   });
 
   // ==== AUTO-REPLY LOKAL (satu handler saja) ====
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages?.[0];
-    if (!msg || msg.key.fromMe) return; // hindari loop
+    if (!msg || msg.key.fromMe) return;
 
     const from = msg.key.remoteJid;
     const pushName = msg.pushName || "";
     const text = (extractText(msg) || "").trim();
     const lower = text.toLowerCase();
 
-    // log ringan agar kelihatan apa yang diterima
     logger.info({ from, pushName, text }, "Incoming message");
 
     // --- Forward ke n8n (fire-and-forget) ---
@@ -123,9 +172,9 @@ async function startWA() {
             "X-Webhook-Token": WEBHOOK_TOKEN,
           },
           body: JSON.stringify({
-            from, // ex: 62812xxxx@s.whatsapp.net
-            text, // isi pesan
-            pushName, // nama tampilan
+            from,
+            text,
+            pushName,
             messageId: msg.key.id,
             timestamp: (msg.messageTimestamp || 0) * 1000,
             isGroup: from.endsWith("@g.us"),
@@ -168,7 +217,7 @@ async function startWA() {
           from,
           `👋 Hai *${
             pushName || "teman"
-          }*!\nBot ini jalan (Baileys/WA Web).\nKetik *menu* untuk lihat perintah.`
+          }*!\nBot ini berjalan pakai Baileys (WA Web).\nKetik *menu* untuk lihat perintah.`
         );
       }
 
@@ -181,13 +230,11 @@ async function startWA() {
         return await sendText(from, `🆔 JID kamu: ${from}`);
       }
 
-      // balas <teks>
       if (lower.startsWith("balas ")) {
         const reply = text.slice(6).trim();
         if (reply) return await sendText(from, reply);
       }
 
-      // foto <url>
       if (lower.startsWith("foto ")) {
         const url = text.slice(5).trim();
         if (!/^https?:\/\//i.test(url)) {
@@ -196,7 +243,7 @@ async function startWA() {
             "❌ URL tidak valid. Contoh: foto https://picsum.photos/600"
           );
         }
-        const resp = await fetch(url); // Node 20+/22: global fetch tersedia
+        const resp = await fetch(url);
         if (!resp.ok) {
           return await sendText(
             from,
@@ -256,7 +303,7 @@ async function sendSafe(jid, content) {
   }
 }
 
-// ==== REST BRIDGE (tes manual) ====
+// ==== REST BRIDGE ====
 const app = express();
 app.use(express.json());
 
@@ -265,7 +312,9 @@ app.get("/health", (_, res) => res.json({ ok: true, ready: isReady }));
 // tampilkan QR di browser (SVG)
 app.get("/qr", async (_, res) => {
   try {
-    if (!lastQR) return res.status(404).send("QR belum tersedia");
+    if (isReady) return res.status(200).send("Sudah tersambung. Tidak ada QR.");
+    if (!lastQR)
+      return res.status(202).send("Menunggu QR, coba lagi sebentar…");
     const svg = await QR.toString(lastQR, { type: "svg", margin: 2 });
     res.setHeader("Content-Type", "image/svg+xml");
     res.send(svg);
@@ -300,8 +349,32 @@ app.get("/sendText", async (req, res) => {
   }
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  // <-- bind ke semua interface (penting di CapRover)
-  console.log("REST listening on :" + PORT);
-  startWA();
+// reset sesi manual (opsional)
+app.post("/reset-session", async (_, res) => {
+  try {
+    await fs.rm(SESSION_DIR, { recursive: true, force: true });
+    await fs.mkdir(SESSION_DIR, { recursive: true });
+    lastQR = "";
+    isReady = false;
+    starting = false;
+    scheduleReconnect(() => startWA(), 300); // trigger start ulang cepat
+    res.json({ ok: true, message: "Session cleared. Reload /qr to scan." });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
 });
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("REST listening on :" + PORT);
+  startWA().catch((e) => logger.error(e));
+});
+
+// Graceful shutdown
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, async () => {
+    try {
+      await sock?.ws?.close();
+    } catch {}
+    process.exit(0);
+  });
+}
