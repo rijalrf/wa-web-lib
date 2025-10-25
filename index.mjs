@@ -7,6 +7,7 @@ import makeWASocket, {
   jidNormalizedUser,
   fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
+
 import qrcode from "qrcode-terminal";
 import QR from "qrcode";
 import fs from "fs/promises";
@@ -187,24 +188,31 @@ async function forceRemoveDir(dir, attempts = 5) {
 async function startWA() {
   if (starting) return;
   starting = true;
-  await ensureSessionDir();
+  try {
+    await ensureSessionDir();
 
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version, isLatest } = await fetchLatestBaileysVersion();
-  logger.info({ version, isLatest }, "Using WhatsApp Web version");
-  sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    browser: ["Windows", "Chrome", "120.0.0"],
-    markOnlineOnConnect: false,
-    syncFullHistory: false,
-    logger,
-    connectTimeoutMs: 30_000,
-    keepAliveIntervalMs: 10_000,
-  });
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    logger.info({ version, isLatest }, "Using WhatsApp Web version");
+    sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: false,
+      browser: ["Windows", "Chrome", "120.0.0"],
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      logger,
+      connectTimeoutMs: 30_000,
+      keepAliveIntervalMs: 10_000,
+    });
 
-  sock.ev.on("creds.update", saveCreds);
+    sock.ev.on("creds.update", saveCreds);
+  } catch (err) {
+    starting = false;
+    logger.error({ err }, "startWA failed");
+    scheduleReconnect(() => startWA(), 2000);
+    return;
+  }
 
   sock.ev.on("connection.update", async (u) => {
     const { connection, lastDisconnect, qr } = u;
@@ -431,8 +439,14 @@ app.get("/health", (_, res) => res.json({ ok: true, ready: isReady }));
 app.get("/qr", async (_, res) => {
   try {
     if (isReady) return res.status(200).send("Sudah tersambung. Tidak ada QR.");
-    if (!lastQR)
+    if (!lastQR) {
+      if (!starting) {
+        startWA().catch((e) =>
+          logger.error({ e }, "startWA re-run from /qr failed")
+        );
+      }
       return res.status(202).send("Menunggu QR, coba lagi sebentar…");
+    }
     const svg = await QR.toString(lastQR, { type: "svg", margin: 2 });
     res.setHeader("Content-Type", "image/svg+xml");
     res.send(svg);
