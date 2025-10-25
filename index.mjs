@@ -260,7 +260,8 @@ async function startWA() {
       if (loggedOut) {
         logger.warn("Detected LOGGED OUT — resetting session dir…");
         try {
-          await fs.rm(SESSION_DIR, { recursive: true, force: true });
+          await closeSocketGracefully();
+          await forceRemoveDir(SESSION_DIR);
           await fs.mkdir(SESSION_DIR, { recursive: true });
         } catch (e) {
           logger.error(e, "Failed to reset session dir");
