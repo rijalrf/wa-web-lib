@@ -137,13 +137,78 @@ function nowWIB() {
   }).format(new Date());
 }
 
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let value = bytes;
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i++;
+  }
+  const fixed = value >= 10 || i === 0 ? value.toFixed(0) : value.toFixed(2);
+  return `${fixed} ${units[i]}`;
+}
+
+async function getSystemStats() {
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const stats = {
+    memory: {
+      used: formatBytes(totalMem - freeMem),
+      total: formatBytes(totalMem),
+    },
+    cpu: {
+      cores: os.cpus()?.length || 1,
+      load: (os.loadavg?.()[0] ?? 0).toFixed(2),
+    },
+    storage: null,
+  };
+
+  try {
+    if (typeof fs.statfs === "function") {
+      const { bsize, blocks, bfree } = await fs.statfs("/usr/src/app");
+      const blockSize = Number(bsize) || 0;
+      const totalBlocks = Number(blocks) || 0;
+      const freeBlocks = Number(bfree) || 0;
+      const totalBytes = blockSize * totalBlocks;
+      const usedBytes = totalBytes - blockSize * freeBlocks;
+      stats.storage = {
+        used: formatBytes(usedBytes),
+        total: formatBytes(totalBytes),
+      };
+    }
+  } catch (err) {
+    logger.warn({ err }, "Failed to read storage stats");
+  }
+
+  return stats;
+}
+
 async function announceUp() {
-  const msg =
-    `✅ *Server Up and Running*\n` +
-    `Server : ${SERVER_NAME}\n` +
-    // `IP     : ${getServerIp()}\n` +
-    `Waktu  : ${nowWIB()} (WIB)\n` +
-    `Status : connected ✅`;
+  const stats = await getSystemStats();
+  const lines = [
+    `✅ *Server Up and Running*`,
+    `Server : ${SERVER_NAME}`,
+    `Waktu  : ${nowWIB()} (WIB)`,
+    `Status : connected ✅`,
+  ];
+
+  if (stats?.cpu) {
+    lines.push(`CPU    : ${stats.cpu.cores} core | load ${stats.cpu.load}`);
+  }
+  if (stats?.memory) {
+    lines.push(
+      `Memory : ${stats.memory.used} / ${stats.memory.total}`
+    );
+  }
+  if (stats?.storage) {
+    lines.push(
+      `Storage: ${stats.storage.used} / ${stats.storage.total}`
+    );
+  }
+
+  const msg = lines.join("\n");
 
   const targets = [UP_PRIVATE, UP_GROUP].filter(Boolean);
   for (const jid of targets) {
