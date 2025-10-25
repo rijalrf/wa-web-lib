@@ -1,7 +1,7 @@
 import express from "express";
 import pino from "pino";
 import dotenv from "dotenv";
-import makeWASocket, {
+import {
   useMultiFileAuthState,
   DisconnectReason,
   jidNormalizedUser,
@@ -29,7 +29,6 @@ const UP_PRIVATE = process.env.UP_PRIVATE || ""; // 62...@s.whatsapp.net
 const UP_GROUP = process.env.UP_GROUP || ""; // 120...@g.us
 const SERVER_NAME =
   process.env.SERVER_NAME || process.env.APP_NAME || os.hostname();
-const SERVER_IP_ENV = process.env.SERVER_IP || "";
 
 // state
 let sock;
@@ -136,19 +135,6 @@ function nowWIB() {
   }).format(new Date());
 }
 
-function getServerIp() {
-  if (SERVER_IP_ENV) return SERVER_IP_ENV;
-  const nets = os.networkInterfaces();
-  for (const name of Object.keys(nets)) {
-    for (const ni of nets[name] || []) {
-      if (ni.family === "IPv4" && !ni.internal) {
-        return ni.address; // catatan: ini IP container/host lokal; pakai SERVER_IP env untuk public IP
-      }
-    }
-  }
-  return "unknown";
-}
-
 async function announceUp() {
   const msg =
     `✅ *Server Up and Running*\n` +
@@ -203,14 +189,18 @@ async function startWA() {
   await ensureSessionDir();
 
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  logger.info({ version, isLatest }, "Using WhatsApp Web version");
   sock = makeWASocket({
+    version,
     auth: state,
     printQRInTerminal: false,
     browser: ["Windows", "Chrome", "120.0.0"],
     markOnlineOnConnect: false,
     syncFullHistory: false,
     logger,
+    connectTimeoutMs: 30_000,
+    keepAliveIntervalMs: 10_000,
   });
 
   sock.ev.on("creds.update", saveCreds);
