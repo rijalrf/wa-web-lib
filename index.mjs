@@ -5,6 +5,7 @@ import {
   useMultiFileAuthState,
   DisconnectReason,
   jidNormalizedUser,
+  fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 import qrcode from "qrcode-terminal";
 import QR from "qrcode";
