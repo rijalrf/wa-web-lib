@@ -1,7 +1,7 @@
 import express from "express";
 import pino from "pino";
 import dotenv from "dotenv";
-import {
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   jidNormalizedUser,
